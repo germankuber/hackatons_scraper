@@ -1,30 +1,26 @@
-import time
+import os
 import re
-from bs4 import BeautifulSoup
+from typing import Optional, Dict, List
 from urllib.parse import urljoin
+
+from bs4 import BeautifulSoup
+from bs4.element import Tag
+from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from supabase import create_client, Client
-from dotenv import load_dotenv
-import os
+from termcolor import cprint
 
+# Load environment variables
 load_dotenv()
-
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
+SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Clean text function
-emoji_pattern = re.compile("[\U00010000-\U0010ffff]", flags=re.UNICODE)
-def clean_text(text):
-    if not text:
-        return ""
-    text = emoji_pattern.sub('', text)  # remove emojis
-    text = re.sub(r'\s+', ' ', text)    # normalize whitespace
-    return text.strip()
-
-# Selenium setup
+# Setup headless browser
 options = Options()
 options.add_argument('--headless')
 options.add_argument('--disable-gpu')
@@ -33,39 +29,54 @@ driver = webdriver.Chrome(options=options)
 base_url = 'https://taikai.network'
 list_url = f"{base_url}/en/hackathons"
 
-# Supabase save functions
-def save_hackathon_data(slug, data):
+emoji_pattern = re.compile("[\U00010000-\U0010ffff]", flags=re.UNICODE)
+
+
+def clean_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    text = emoji_pattern.sub('', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def wait_for_element(by: By, value: str, timeout: int = 10) -> None:
+    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
+
+
+def save_hackathon_data(slug: str, data: Dict[str, str]) -> Optional[int]:
     cleaned_data = {
         "slug": slug,
-        "url": clean_text(data.get("url", "")),
-        "description": clean_text(data.get("description", ""))
+        "url": clean_text(data.get("url")),
+        "description": clean_text(data.get("description"))
     }
-    response = supabase.table("hackathons").upsert(cleaned_data, on_conflict=["slug"]).select("id").execute()
-    if response.data:
+    response = supabase.table("hackathons").upsert(cleaned_data, on_conflict=["slug"]).execute()
+    if response.data and isinstance(response.data, list) and "id" in response.data[0]:
         hackathon_id = response.data[0]["id"]
-        print(f"✅ Saved hackathon {slug} with ID {hackathon_id}")
+        cprint(f"[✔] Hackathon '{slug}' saved with ID {hackathon_id}", "green")
         return hackathon_id
     else:
-        print(f"❌ Failed to save or retrieve hackathon ID for {slug}")
+        cprint(f"[✖] Failed to save or retrieve hackathon ID for '{slug}'", "red")
         return None
 
-def save_project_data(hackathon_id, project_data):
+
+def save_project_data(hackathon_id: int, project_data: Dict[str, object]) -> None:
     try:
         cleaned_data = {
             "hackathon_id": hackathon_id,
             "title": clean_text(project_data.get("title", "")),
             "description": clean_text(project_data.get("description", "")),
-            "tags": sorted(set(clean_text(tag) for tag in project_data.get("tags", []))),
+            "tags": sorted(set(clean_text(tag) for tag in project_data.get("tags", []))),  # type: ignore
             "url": clean_text(project_data.get("url", ""))
         }
         supabase.table("projects").insert(cleaned_data).execute()
-        print(f"✅ Saved project for hackathon ID {hackathon_id}")
+        cprint(f"   ↳ Project '{cleaned_data['title'][:60]}' saved", "cyan")
     except Exception as e:
-        print(f"❌ Failed to save project: {e}")
+        cprint(f"[✖] Failed to save project: {e}", "red")
 
-# Project data extraction
-def extract_project_data(hackathon_id):
-    time.sleep(1)
+
+def extract_project_data(hackathon_id: int) -> None:
+    wait_for_element(By.CLASS_NAME, 'html-editor-body')
     soup = BeautifulSoup(driver.page_source, 'html.parser')
 
     title = ""
@@ -80,7 +91,7 @@ def extract_project_data(hackathon_id):
     if body_div:
         description = body_div.get_text(strip=True, separator='\n')
 
-    tags = []
+    tags: List[str] = []
     for ul in soup.find_all('ul', class_='tags'):
         tags += [span.get_text(strip=True) for span in ul.find_all('span')]
 
@@ -91,15 +102,15 @@ def extract_project_data(hackathon_id):
         "url": driver.current_url
     })
 
-# Paginated project traversal
-def extract_data_from_hackathon(hackathon_id):
+
+def extract_data_from_hackathon(hackathon_id: int) -> None:
     while True:
-        time.sleep(1)
+        wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         project_divs = soup.select('div.gFHDc')
-        print(f"Found {len(project_divs)} projects.")
+        cprint(f"   → Found {len(project_divs)} projects on page", "yellow")
 
-        for i, div in enumerate(project_divs):
+        for div in project_divs:
             a_tag = div.find('a')
             if not a_tag or not a_tag.get('href'):
                 continue
@@ -107,22 +118,24 @@ def extract_data_from_hackathon(hackathon_id):
             driver.get(project_url)
             extract_project_data(hackathon_id)
             driver.back()
-            time.sleep(1)
+            wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
 
-        # Pagination
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         next_btn = soup.select_one('ul.pagination li.next a')
         if not next_btn or next_btn.get('aria-disabled') == 'true':
-            break
-        try:
-            driver.execute_script("arguments[0].click();", driver.find_element("css selector", 'ul.pagination li.next a'))
-            time.sleep(2)
-        except Exception as e:
-            print(f"Pagination failed: {e}")
+            cprint("   ↳ No more project pages", "magenta")
             break
 
-# Hackathon handler
-def navigate_to_hackathon(a_tag):
+        try:
+            driver.execute_script("arguments[0].click();", driver.find_element(By.CSS_SELECTOR, 'ul.pagination li.next a'))
+            cprint("   ↪ Moving to next project page...", "blue")
+            wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
+        except Exception as e:
+            cprint(f"[✖] Pagination failed: {e}", "red")
+            break
+
+
+def navigate_to_hackathon(a_tag: Tag) -> None:
     href = a_tag.get('href')
     if not href:
         return
@@ -130,7 +143,7 @@ def navigate_to_hackathon(a_tag):
     slug = href.rstrip('/').split('/')[-1]
     full_url = urljoin(base_url, href)
     driver.get(full_url)
-    time.sleep(1)
+    wait_for_element(By.CLASS_NAME, 'menu')
 
     soup = BeautifulSoup(driver.page_source, 'html.parser')
     menu = soup.find('ul', class_='menu')
@@ -142,7 +155,7 @@ def navigate_to_hackathon(a_tag):
         a = li.find('a')
         if a and a.text.strip() == 'Overview':
             driver.get(urljoin(base_url, a['href']))
-            time.sleep(1)
+            wait_for_element(By.CLASS_NAME, 'html-editor-body')
             overview_soup = BeautifulSoup(driver.page_source, 'html.parser')
             div = overview_soup.find('div', class_='html-editor-body')
             if div:
@@ -160,44 +173,46 @@ def navigate_to_hackathon(a_tag):
         a = li.find('a')
         if a and a.text.strip() == 'Projects':
             driver.get(urljoin(base_url, a['href']))
-            time.sleep(1)
+            wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
             extract_data_from_hackathon(hackathon_id)
             break
 
-# Initial scrape
-def scrape():
+
+def scrape() -> None:
     driver.get(list_url)
-    time.sleep(1)
+    wait_for_element(By.CSS_SELECTOR, 'div.jIFIob')
+    page = 1
 
     while True:
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         hackathon_divs = soup.select('div.jIFIob')
-        print(f"Found {len(hackathon_divs)} hackathons on current page.")
+        cprint(f"\n🌍 Page {page}: Found {len(hackathon_divs)} hackathons", "blue", attrs=["bold"])
 
         for div in hackathon_divs:
+            status_div = div.find('div', class_='hnwMbs')
+            if not status_div or status_div.get_text(strip=True) != "Finished":
+                continue
             a_tag = div.find('a')
             if a_tag:
-                 navigate_to_hackathon(a_tag)
+                navigate_to_hackathon(a_tag)
 
-        # Verificar si hay un botón "Next" habilitado
         next_button = soup.select_one('ul.pagination li.next a')
         if not next_button or next_button.get('aria-disabled') == 'true':
-            print("✅ No more hackathon pages.")
+            cprint("\n✅ Finished all hackathon pages", "green", attrs=["bold"])
             break
-
-        # Click en el botón "Next"
         try:
-            next_elem = driver.find_element("css selector", 'ul.pagination li.next a')
-            driver.execute_script("arguments[0].click();", next_elem)
-            print("➡️ Moving to next hackathon page...")
-            time.sleep(2)
+            driver.execute_script("arguments[0].click();", driver.find_element(By.CSS_SELECTOR, 'ul.pagination li.next a'))
+            page += 1
+            wait_for_element(By.CSS_SELECTOR, 'div.jIFIob')
         except Exception as e:
-            print(f"❌ Failed to click next page: {e}")
+            cprint(f"[✖] Failed to click next hackathon page: {e}", "red")
             break
 
-# Run
+
 if __name__ == '__main__':
     try:
+        cprint("🚀 Starting hackathon scraper...\n", "cyan", attrs=["bold"])
         scrape()
     finally:
         driver.quit()
+        cprint("\n🧹 Browser session closed", "white", attrs=["dark"])
