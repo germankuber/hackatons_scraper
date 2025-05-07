@@ -122,6 +122,7 @@ def extract_project_data(hackathon_id: int) -> None:
 def extract_data_from_hackathon(hackathon_id: int) -> None:
     while True:
         wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
+        time.sleep(2)  # Allow time for the page to load completely
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         project_divs = soup.select('div.gFHDc')
         cprint(f"   → Found {len(project_divs)} projects on page", "yellow")
