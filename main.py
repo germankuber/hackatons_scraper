@@ -1,4 +1,5 @@
 import os
+import time
 import re
 from typing import Optional, Dict, List
 from urllib.parse import urljoin
@@ -48,7 +49,8 @@ def save_hackathon_data(slug: str, data: Dict[str, str]) -> Optional[int]:
     cleaned_data = {
         "slug": slug,
         "url": clean_text(data.get("url")),
-        "description": clean_text(data.get("description"))
+        "description": clean_text(data.get("description")),
+        "processed": False
     }
     response = supabase.table("hackathons").upsert(cleaned_data, on_conflict=["slug"]).execute()
     if response.data and isinstance(response.data, list) and "id" in response.data[0]:
@@ -58,6 +60,14 @@ def save_hackathon_data(slug: str, data: Dict[str, str]) -> Optional[int]:
     else:
         cprint(f"[✖] Failed to save or retrieve hackathon ID for '{slug}'", "red")
         return None
+
+
+def mark_hackathon_processed(hackathon_id: int) -> None:
+    try:
+        supabase.table("hackathons").update({"processed": True}).eq("id", hackathon_id).execute()
+        cprint(f"   ↳ Hackathon ID {hackathon_id} marked as processed", "green")
+    except Exception as e:
+        cprint(f"[✖] Failed to mark hackathon as processed: {e}", "red")
 
 
 def save_project_data(hackathon_id: int, project_data: Dict[str, object]) -> None:
@@ -76,7 +86,8 @@ def save_project_data(hackathon_id: int, project_data: Dict[str, object]) -> Non
 
 
 def extract_project_data(hackathon_id: int) -> None:
-    wait_for_element(By.CLASS_NAME, 'html-editor-body')
+    # wait_for_element(By.CLASS_NAME, 'html-editor-body')
+    time.sleep(2)  # Allow time for the page to load completely
     soup = BeautifulSoup(driver.page_source, 'html.parser')
 
     title = ""
@@ -129,7 +140,7 @@ def extract_data_from_hackathon(hackathon_id: int) -> None:
         try:
             driver.execute_script("arguments[0].click();", driver.find_element(By.CSS_SELECTOR, 'ul.pagination li.next a'))
             cprint("   ↪ Moving to next project page...", "blue")
-            wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
+            time.sleep(3)
         except Exception as e:
             cprint(f"[✖] Pagination failed: {e}", "red")
             break
@@ -175,6 +186,7 @@ def navigate_to_hackathon(a_tag: Tag) -> None:
             driver.get(urljoin(base_url, a['href']))
             wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
             extract_data_from_hackathon(hackathon_id)
+            mark_hackathon_processed(hackathon_id)
             break
 
 
@@ -192,9 +204,27 @@ def scrape() -> None:
             status_div = div.find('div', class_='hnwMbs')
             if not status_div or status_div.get_text(strip=True) != "Finished":
                 continue
+
             a_tag = div.find('a')
-            if a_tag:
-                navigate_to_hackathon(a_tag)
+            if not a_tag:
+                continue
+
+            href = a_tag.get('href')
+            slug = href.rstrip('/').split('/')[-1]
+
+            # 🔎 Check DB for existing hackathon
+            result = supabase.table("hackathons").select("id, processed").eq("slug", slug).execute()
+            if result.data:
+                existing = result.data[0]
+                if existing.get("processed") is True:
+                    cprint(f"⏭ Skipping already processed hackathon '{slug}'", "white")
+                    continue
+                else:
+                    hackathon_id = existing["id"]
+                    cprint(f"🧹 Removing incomplete projects for '{slug}'", "yellow")
+                    supabase.table("projects").delete().eq("hackathon_id", hackathon_id).execute()
+
+            navigate_to_hackathon(a_tag)
 
         next_button = soup.select_one('ul.pagination li.next a')
         if not next_button or next_button.get('aria-disabled') == 'true':
@@ -203,7 +233,7 @@ def scrape() -> None:
         try:
             driver.execute_script("arguments[0].click();", driver.find_element(By.CSS_SELECTOR, 'ul.pagination li.next a'))
             page += 1
-            wait_for_element(By.CSS_SELECTOR, 'div.jIFIob')
+            time.sleep(3)
         except Exception as e:
             cprint(f"[✖] Failed to click next hackathon page: {e}", "red")
             break
