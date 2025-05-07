@@ -22,9 +22,14 @@ SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Setup headless browser
+# options = Options()
+# options.add_argument('--headless')
+# options.add_argument('--disable-gpu')
+
 options = Options()
-options.add_argument('--headless')
-options.add_argument('--disable-gpu')
+options.add_argument("--headless=new")  # usar el modo headless moderno
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
 driver = webdriver.Chrome(options=options)
 
 base_url = 'https://taikai.network'
@@ -184,7 +189,8 @@ def navigate_to_hackathon(a_tag: Tag) -> None:
         a = li.find('a')
         if a and a.text.strip() == 'Projects':
             driver.get(urljoin(base_url, a['href']))
-            wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
+            # wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
+            time.sleep(2)  # Allow time for the page to load completely
             extract_data_from_hackathon(hackathon_id)
             mark_hackathon_processed(hackathon_id)
             break
