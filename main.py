@@ -47,7 +47,8 @@ def clean_text(text: Optional[str]) -> str:
 
 
 def wait_for_element(by: By, value: str, timeout: int = 10) -> None:
-    WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
+    time.sleep(2)  # Allow time for the page to load completely
+    # WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
 
 
 def save_hackathon_data(slug: str, data: Dict[str, str]) -> Optional[int]:
@@ -122,7 +123,7 @@ def extract_project_data(hackathon_id: int) -> None:
 def extract_data_from_hackathon(hackathon_id: int) -> None:
     while True:
         wait_for_element(By.CSS_SELECTOR, 'div.gFHDc')
-        time.sleep(2)  # Allow time for the page to load completely
+        # time.sleep(2)  # Allow time for the page to load completely
         soup = BeautifulSoup(driver.page_source, 'html.parser')
         project_divs = soup.select('div.gFHDc')
         cprint(f"   → Found {len(project_divs)} projects on page", "yellow")
