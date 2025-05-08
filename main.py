@@ -1,9 +1,8 @@
-import json
 import os
 import re
 import time
 import unicodedata
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -20,192 +19,121 @@ from termcolor import cprint
 
 # Load environment variables
 load_dotenv()
-SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY: str = os.getenv("SUPABASE_KEY", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Setup headless browser
-# options = Options()
-# options.add_argument('--headless')
-# options.add_argument('--disable-gpu')
-
+# Setup headless Chrome
 options = Options()
-options.add_argument("--headless=new")  # usar el modo headless moderno
+options.add_argument("--headless=new")
 options.add_argument("--no-sandbox")
 options.add_argument("--disable-dev-shm-usage")
 driver = webdriver.Chrome(options=options)
 
 base_url = "https://taikai.network"
-list_url = f"{base_url}/en/hackathons"
-
-emoji_pattern = re.compile("[\U00010000-\U0010ffff]", flags=re.UNICODE)
 
 
 def clean_text(text: Optional[str]) -> str:
+    """Remove all Unicode symbols and collapse whitespace."""
     if not text:
         return ""
-    # 1) Remove *all* Unicode symbols (emojis, dingbats like ⚡, currency signs, math symbols…)
-    filtered = []
-    for ch in text:
-        # category starting with 'S' means Symbol
-        if unicodedata.category(ch).startswith("S"):
-            continue
-        filtered.append(ch)
-    text = "".join(filtered)
-    # 2) Collapse whitespace
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    filtered = [ch for ch in text if not unicodedata.category(ch).startswith("S")]
+    return re.sub(r"\s+", " ", "".join(filtered)).strip()
 
 
 def wait_for_element(by: By, value: str, timeout: int = 10) -> None:
-    # time.sleep(1)  # Allow time for the page to load completely
     WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
 
 
+def save_hackathon_data(slug: str, data: Dict[str, str]) -> Optional[int]:
+    cleaned = {
+        "slug": slug,
+        "url": clean_text(data.get("url")),
+        "description": clean_text(data.get("description")),
+        "processed": False,
+    }
+    resp = supabase.table("hackathons").upsert(cleaned, on_conflict=["slug"]).execute()
+    if resp.data and isinstance(resp.data, list) and "id" in resp.data[0]:
+        hid = resp.data[0]["id"]
+        cprint(f"[✔] Hackathon '{slug}' saved (ID {hid})", "green")
+        return hid
+    else:
+        cprint(f"[✖] Could not save hackathon '{slug}'", "red")
+        return None
+
+
+def mark_hackathon_processed(hackathon_id: int) -> None:
+    supabase.table("hackathons").update({"processed": True}).eq(
+        "id", hackathon_id
+    ).execute()
+    cprint(f"   ↳ Hackathon ID {hackathon_id} marked processed", "green")
+
+
+def extract_data_from_hackathon(hackathon_id: int) -> None:
+    """Scrape all project links on current page, then recurse through pagination."""
+    while True:
+        wait_for_element(By.CSS_SELECTOR, "div.gFHDc")
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        project_divs = soup.select("div.gFHDc")
+        cprint(f"   → Found {len(project_divs)} projects", "yellow")
+
+        for div in project_divs:
+            link = div.find("a", href=True)
+            if not link:
+                continue
+            driver.get(urljoin(driver.current_url, link["href"]))
+            time.sleep(2)
+            # reuse your existing extract_project_data logic here:
+            extract_project_data(hackathon_id)
+            driver.back()
+            wait_for_element(By.CSS_SELECTOR, "div.gFHDc")
+
+        next_btn = soup.select_one("ul.pagination li.next a")
+        if not next_btn or next_btn.get("aria-disabled") == "true":
+            break
+        driver.execute_script(
+            "arguments[0].click()",
+            driver.find_element(By.CSS_SELECTOR, "ul.pagination li.next a"),
+        )
+        time.sleep(2)
+
+
 def extract_project_data(hackathon_id: int) -> None:
-    # wait_for_element(By.CLASS_NAME, 'html-editor-body')
-    time.sleep(2)  # Allow time for the page to load completely
+    """Extract title, description, tags, url and save to DB."""
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
-    title = ""
-    title_container = soup.find("div", class_="iwSID")
-    if title_container:
-        h1 = title_container.find("h1")
-        if h1:
-            title = h1.get_text(strip=True)
-
-    description = ""
-    body_div = soup.find("div", class_="html-editor-body")
-    if body_div:
-        description = body_div.get_text(strip=True, separator="\n")
-
-    tags: List[str] = []
-    for ul in soup.find_all("ul", class_="tags"):
-        tags += [span.get_text(strip=True) for span in ul.find_all("span")]
-
-    save_project_data(
-        hackathon_id,
-        {
-            "title": title,
-            "description": description,
-            "tags": tags,
-            "url": driver.current_url,
-        },
+    title = (
+        soup.find("div", class_="iwSID").get_text(strip=True)
+        if soup.find("div", class_="iwSID")
+        else ""
     )
+    desc_div = soup.find("div", class_="html-editor-body")
+    description = desc_div.get_text(separator="\n", strip=True) if desc_div else ""
+    tags = [
+        span.get_text(strip=True)
+        for ul in soup.find_all("ul", class_="tags")
+        for span in ul.find_all("span")
+    ]
+    url = driver.current_url
 
-
-def fetch_challenges_page(page: int, cookies: str) -> List[Dict]:
-    """Fetch one page of challenges (hackathons) from Taikai API."""
-    url = "https://api.taikai.network/api/graphql"
-    headers = {
-        "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
-        "content-type": "application/json",
-        "cookie": cookies,
-        "referer": "https://taikai.network/",
-        "origin": "https://taikai.network",
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    cleaned = {
+        "hackathon_id": hackathon_id,
+        "title": clean_text(title),
+        "description": clean_text(description),
+        "tags": sorted(set(clean_text(t) for t in tags)),
+        "url": clean_text(url),
     }
+    supabase.table("projects").insert(cleaned).execute()
+    cprint(f"   ↳ Project '{cleaned['title'][:50]}' saved", "cyan")
 
-    payload = {
-        "operationName": "ALL_CHALLENGES_QUERY",
-        "variables": {
-            "sortBy": {"order": "desc"},
-            "searchTerm": "%%",
-            "page": page,
-        },
-        "query": """
-        query ALL_CHALLENGES_QUERY(
-          $sortBy: ChallengeOrderByWithRelationInput,
-          $searchTerm: String,
-          $page: Int
-        ) {
-          challenges(
-            where: {
-              publishInfo: {state: {equals: ACTIVE}},
-              OR: [
-                {name: {contains: $searchTerm, mode: insensitive}},
-                {slug: {contains: $searchTerm, mode: insensitive}},
-                {organization: {name: {contains: $searchTerm, mode: insensitive}}}
-              ]
-            },
-            page: $page,
-            orderBy: $sortBy
-          ) {
-            id
-            name
-            slug
-            isClosed
-            organization {
-              id
-              name
-              slug
-            }
-            industries {
-                title
-                }
-          }
-        }
-        """,
+
+def load_all_data(cookies: str) -> None:
+    """Fetch challenges via GraphQL, save hackathons + projects in batch."""
+    existing = {
+        row["external_id"]
+        for row in supabase.table("hackathons").select("external_id").execute().data
+        or []
     }
-
-    response = requests.post(url, headers=headers, json=payload)
-    if response.status_code != 200:
-        cprint(
-            f"[✖] Challenge fetch failed (page {page}): {response.status_code}", "red"
-        )
-        return []
-
-    try:
-        return response.json()["data"]["challenges"]
-    except Exception as e:
-        cprint(f"[✖] JSON parse error for challenges: {e}", "red")
-        return []
-
-
-def fetch_projects_for_challenge(challenge_id: str, cookies: str) -> List[Dict]:
-    """Fetch all projects for a given challenge (hackathon) ID."""
-    url = "https://api.taikai.network/api/graphql"
-    headers = {
-        "accept": "*/*",
-        "content-type": "application/json",
-        "cookie": cookies,
-        "referer": "https://taikai.network/",
-        "origin": "https://taikai.network",
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
-    }
-
-    raw_body = """{"operationName":"PROJECTS_BY_CHALLENGE","variables":{"orderBy":{"name":"asc"},"page":0,"whereInput":{"state":{"in":["ACTIVE","DRAFT","NOT_ELIGIBLE"]},"name":{"contains":"","mode":"insensitive"},"challenge":{"id":{"equals":"__CHALLENGE_ID__"}}},"username":"german.kuber"},"query":"query PROJECTS_BY_CHALLENGE( $orderBy: ProjectOrderByWithRelationInput!, $whereInput: ProjectWhereInput, $page: Int) {\\n  projects(orderBy: $orderBy, where: $whereInput, page: $page) {\\n    id\\n    name\\n    teaser\\n    description\\n    state\\n    viewsCount\\n    favoritesCount\\n    backersCount\\n    totalBacked\\n  }\\n}\\n"}"""
-    body = raw_body.replace("__CHALLENGE_ID__", challenge_id)
-
-    response = requests.post(url, headers=headers, data=body)
-    if response.status_code != 200:
-        cprint(
-            f"[✖] Project fetch failed for {challenge_id}: {response.status_code}",
-            "red",
-        )
-        return []
-
-    try:
-        return response.json()["data"]["projects"]
-    except Exception as e:
-        cprint(f"[✖] JSON parse error for projects: {e}", "red")
-        return []
-
-
-def get_existing_hackathon_ids() -> Set[str]:
-    """Fetch all stored hackathon external_ids from the database."""
-    try:
-        response = supabase.table("hackathons").select("external_id").execute()
-        return {row["external_id"] for row in response.data} if response.data else set()
-    except Exception as e:
-        cprint(f"[✖] Failed to fetch existing hackathons: {e}", "red")
-        return set()
-
-
-def load_all_data():
-    cookies = "PUT_REAL_COOKIES_HERE"
-    stored_ids = get_existing_hackathon_ids()
 
     for page in range(20):
         challenges = fetch_challenges_page(page, cookies)
@@ -213,16 +141,10 @@ def load_all_data():
             continue
 
         for ch in challenges:
-            if not ch.get("isClosed", False):
+            if not ch.get("isClosed") or ch["id"] in existing:
                 continue
 
-            if ch["id"] in stored_ids:
-                cprint(f"⏭ Skipping already saved hackathon: {ch['name']}", "yellow")
-                continue
-
-            # Save hackathon
-            industry_titles = [ind["title"] for ind in ch.get("industries", [])]
-
+            industries = [ind["title"] for ind in ch.get("industries", [])]
             hackathon_data = {
                 "external_id": ch["id"],
                 "organization_id": ch["organization"]["id"],
@@ -230,93 +152,176 @@ def load_all_data():
                 "organization_slug": ch["organization"]["slug"],
                 "slug": ch.get("slug", ""),
                 "name": clean_text(ch.get("name", "")),
-                "industries": industry_titles,  # << only the titles
+                "industries": industries,
                 "processed": False,
             }
-            result = (
+            res = (
                 supabase.table("hackathons")
                 .upsert(hackathon_data, on_conflict=["external_id"])
                 .execute()
             )
-            hackathon_id = result.data[0]["id"]
-            cprint(
-                f"✔ Saved hackathon: {hackathon_data['name']} (DB ID: {hackathon_id})",
-                "green",
-            )
+            hid = res.data[0]["id"]
+            cprint(f"✔ Saved hackathon '{hackathon_data['name']}' (ID {hid})", "green")
 
-            # Fetch and save projects in batch
             projects = fetch_projects_for_challenge(ch["id"], cookies)
-            project_records = []
-
-            for p in projects:
-                project_data = {
+            records = [
+                {
                     "external_id": p["id"],
-                    "hackathon_id": hackathon_id,
+                    "hackathon_id": hid,
                     "title": clean_text(p.get("name", "")),
                     "description": clean_text(p.get("description", "")),
                     "tags": [],
-                    "url": f"https://taikai.network/project/{p['id']}",
+                    "url": f"{base_url}/project/{p['id']}",
                     "processed": False,
                 }
-                project_records.append(project_data)
+                for p in projects
+            ]
 
-            if project_records:
+            if records:
                 supabase.table("projects").upsert(
-                    project_records, on_conflict=["external_id"]
+                    records, on_conflict=["external_id"]
                 ).execute()
-                cprint(f"   ↳ {len(project_records)} projects inserted", "cyan")
+                cprint(f"   ↳ {len(records)} projects inserted", "cyan")
 
 
 def load_hackathons() -> None:
-    """
-    Load all hackathons from the DB where processed = False,
-    navigate to each hackathon’s Overview page, scrape its
-    description (and URL), update the DB record, and mark as processed.
-    """
-    # 1) Fetch pending hackathons (id + slug)
-    resp = (
+    """Scrape the overview page of each unprocessed hackathon, then mark processed."""
+    rows = (
         supabase.table("hackathons")
         .select("id, slug, organization_slug")
         .eq("processed", False)
         .execute()
+        .data
+        or []
     )
-    hackathons = resp.data or []
+    for h in rows:
+        hid, slug, org_slug = h["id"], h["slug"], h["organization_slug"]
+        url = f"{base_url}/{org_slug}/hackathons/{slug}"
+        driver.get(url)
+        time.sleep(2)
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        div = soup.find("div", class_="html-editor-body")
+        desc = clean_text(div.get_text(separator="\n")) if div else ""
+        supabase.table("hackathons").update(
+            {"url": url, "description": desc, "processed": True}
+        ).eq("id", hid).execute()
+        cprint(f"[✔] Updated hackathon '{slug}' (ID {hid})", "green")
 
-    for h in hackathons:
-        hackathon_id = h["id"]
-        slug = h.get("slug")
-        organization_slug = h.get("organization_slug")
 
-        if not slug:
-            cprint(f"[✖] Missing slug for hackathon ID {hackathon_id}", "red")
+def load_projects() -> None:
+    """
+    Fetch all unprocessed projects from the DB along with their parent hackathon’s
+    slug and organization_slug, build the correct project URL, scrape each project,
+    update its fields and mark it processed.
+    """
+    # 1) Fetch projects + related hackathon info in one call
+    resp = (
+        supabase.table("projects")
+        .select(
+            """
+            id,
+            external_id,
+            processed,
+            hackathon: hackathon_id (
+                slug,
+                organization_slug
+            )
+        """
+        )
+        .eq("processed", False)
+        .execute()
+    )
+    rows = resp.data or []
+
+    if not rows:
+        cprint("No unprocessed projects found.", "yellow")
+        return
+
+    for row in rows:
+        project_id = row["id"]
+        external_id = row["external_id"]
+        hackathon_info = row.get("hackathon", {})
+        hack_slug = hackathon_info.get("slug")
+        org_slug = hackathon_info.get("organization_slug")
+
+        if not (hack_slug and org_slug and external_id):
+            cprint(f"[✖] Missing data for project ID {project_id}", "red")
             continue
 
-        # 2) Build the hackathon URL and navigate there
-        hackathon_url = f"{base_url}/{organization_slug}/hackathons/{slug}"
-        print(f"🔗 Navigating to {hackathon_url}")
-        driver.get(hackathon_url)
-        time.sleep(2)  # Allow time for the page to load completely
+        # 2) Build the project URL
+        project_url = (
+            f"{base_url}/{org_slug}/hackathons/{hack_slug}/projects/{external_id}/idea"
+        )
+        cprint(f"→ Scraping {project_url}", "blue")
 
-        # 3) Click into the "Overview" tab
+        # 3) Open and wait for content
+        driver.get(project_url)
+        time.sleep(2)
+
+        # 4) Extract title, description, tags
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        body_div = soup.find("div", class_="html-editor-body")
-        description = clean_text(body_div.get_text(separator="\n")) if body_div else ""
 
-        # 5) Update DB record: set url, description, processed = True
+        title_tag = soup.find("h1")
+        title = clean_text(title_tag.get_text()) if title_tag else ""
+
+        desc_div = soup.find("div", class_="html-editor-body")
+        description = clean_text(desc_div.get_text(separator="\n")) if desc_div else ""
+
+        tags = []
+        for ul in soup.find_all("ul", class_="tags"):
+            tags.extend(clean_text(span.get_text()) for span in ul.find_all("span"))
+
+        # 5) Update record and mark processed
         try:
-            supabase.table("hackathons").update(
-                {"url": hackathon_url, "description": description, "processed": True}
-            ).eq("id", hackathon_id).execute()
-            cprint(f"[✔] Updated hackathon '{slug}' (ID {hackathon_id})", "green")
+            supabase.table("projects").update(
+                {
+                    "title": title,
+                    "description": description,
+                    "tags": sorted(set(tags)),
+                    "processed": True,
+                }
+            ).eq("id", project_id).execute()
+            cprint(f"✔ Updated project ID {project_id}", "cyan")
         except Exception as e:
-            cprint(f"[✖] Failed to update hackathon '{slug}': {e}", "red")
+            cprint(f"[✖] Failed to update project ID {project_id}: {e}", "red")
+
+        time.sleep(1)  # throttle requests
+
+
+def scrape_and_update_project(project_id: int, project_url: str) -> None:
+    """Helper: open project page, extract fields, update DB + mark processed."""
+    driver.get(project_url)
+    time.sleep(2)
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+
+    title_tag = soup.find("h1")
+    title = clean_text(title_tag.get_text()) if title_tag else ""
+    div = soup.find("div", class_="html-editor-body")
+    desc = clean_text(div.get_text(separator="\n")) if div else ""
+    tags = [
+        clean_text(span.get_text())
+        for ul in soup.find_all("ul", class_="tags")
+        for span in ul.find_all("span")
+    ]
+
+    supabase.table("projects").update(
+        {
+            "title": title,
+            "description": desc,
+            "tags": sorted(set(tags)),
+            "processed": True,
+        }
+    ).eq("id", project_id).execute()
+    cprint(f"✔ Updated project ID {project_id}", "cyan")
 
 
 if __name__ == "__main__":
     try:
-        cprint("🚀 Starting hackathon scraper...\n", "cyan", attrs=["bold"])
-        # load_all_data()
-        load_hackathons()
+        cprint("🚀 Starting loader...\n", "cyan", attrs=["bold"])
+        cookies = "PUT_REAL_COOKIES_HERE"
+        # load_all_data(cookies)
+        # load_hackathons()
+        load_projects()
     finally:
         driver.quit()
-        cprint("\n🧹 Browser session closed", "white", attrs=["dark"])
+        cprint("\n🧹 Browser session closed", "white")
